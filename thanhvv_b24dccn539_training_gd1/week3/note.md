@@ -178,57 +178,149 @@ $$\text{Guest Virtual Address (GVA)} \xrightarrow{\text{Guest Page Tables}} \tex
 ---
 
 ### 7. Thực hành quản lý VM (Với KVM/QEMU/libvirt trên Ubuntu)
+Mình viết lại theo kiểu thêm user vào nhóm `libvirt`/`kvm`, dùng `sudo` cho các lệnh cần quyền ghi vào `/var/lib/libvirt/images`. Vì nhóm mới chỉ có hiệu lực sau khi đăng nhập lại, mình tách làm 2 phần.
+
+## Phần 1: Cài đặt và thêm user
 
 ```bash
-# 1. Kiểm tra CPU hỗ trợ ảo hóa và cài đặt KVM
-egrep -c '(vmx|svm)' /proc/cpuinfo
-sudo apt update && sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst cloud-image-utils
-sudo usermod -aG libvirt,kvm $USER && newgrp libvirt
+#!/usr/bin/env bash
+set -e
 
-# 2. Tạo ổ đĩa qcow2 (20GB) và khởi tạo VM Ubuntu Server
-sudo qemu-img create -f qcow2 /var/lib/libvirt/images/ubuntu-srv.qcow2 20G
-virt-install \
-  --name ubuntu-srv --ram 2048 --vcpus 2 \
-  --disk path=/var/lib/libvirt/images/ubuntu-srv.qcow2,format=qcow2,bus=virtio \
+# Kiểm tra CPU hỗ trợ ảo hóa (kết quả phải > 0)
+grep -Ec '(vmx|svm)' /proc/cpuinfo
+
+sudo apt update
+sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients \
+  bridge-utils virtinst cloud-image-utils cloud-guest-utils
+sudo systemctl enable --now libvirtd
+
+# Thêm user hiện tại (kể cả khi chạy bằng sudo) vào nhóm libvirt và kvm
+TARGET_USER=${SUDO_USER:-$USER}
+sudo usermod -aG libvirt,kvm "$TARGET_USER"
+echo "Đã thêm $TARGET_USER vào nhóm libvirt,kvm -> LOGOUT/LOGIN lại rồi chạy Phần 2"
+```
+
+## Phần 2: Tạo và quản lý VM
+
+```bash
+#!/usr/bin/env bash
+set -e
+export LIBVIRT_DEFAULT_URI=qemu:///system
+IMG=/var/lib/libvirt/images
+VM=ubuntu-srv
+
+wait_off() { while [ "$(virsh domstate "$1")" != "shut off" ]; do sleep 2; done; }
+
+# 1. Tải ISO (tự lấy tên bản mới nhất) và tạo ổ đĩa
+cd $IMG
+ISO_NAME=$(curl -s https://releases.ubuntu.com/24.04/SHA256SUMS | grep -o 'ubuntu-24.04[0-9.]*-live-server-amd64.iso' | head -1)
+[ -f "$ISO_NAME" ] || sudo wget "https://releases.ubuntu.com/24.04/$ISO_NAME"
+[ -f $VM.qcow2 ] || sudo qemu-img create -f qcow2 $IMG/$VM.qcow2 20G
+
+# 2. Cài VM (tương tác, đi qua installer trong console)
+sudo virt-install \
+  --name $VM --ram 2048 --vcpus 2 \
+  --disk path=$IMG/$VM.qcow2,format=qcow2,bus=virtio \
   --os-variant ubuntu24.04 --network network=default,model=virtio \
   --graphics none --console pty,target_type=serial \
-  --location '[https://releases.ubuntu.com/24.04/ubuntu-24.04.1-live-server-amd64.iso](https://releases.ubuntu.com/24.04/ubuntu-24.04.1-live-server-amd64.iso)' \
+  --location "$IMG/$ISO_NAME,kernel=casper/vmlinuz,initrd=casper/initrd" \
   --extra-args 'console=ttyS0,115200n8 serial'
+# Thoát console: Ctrl + ]   |  Vào lại: virsh console ubuntu-srv
+# Trong guest kiểm tra: lscpu | free -h | lsblk
 
-# Quan sát tài nguyên bên trong Guest OS sau khi cài đặt:
-lscpu      # Kiểm tra 2 vCPU và Hypervisor vendor: KVM
-free -h    # Kiểm tra 2GB RAM
-lsblk      # Kiểm tra ổ đĩa ảo /dev/vda dung lượng 20GB
+# 3. Snapshot / revert
+virsh snapshot-create-as $VM snap-initial --description "Clean OS"
+virsh snapshot-list $VM
+virsh snapshot-revert $VM snap-initial
 
-# 3. Tạo Snapshot và Revert
-virsh snapshot-create-as --domain ubuntu-srv --name "snap-initial" --description "Clean OS"
-virsh snapshot-list --domain ubuntu-srv
-virsh snapshot-revert --domain ubuntu-srv --snapshotname "snap-initial"
+# 4. Clone
+virsh shutdown $VM || true; wait_off $VM
+sudo virt-clone --original $VM --name $VM-clone --file $IMG/$VM-clone.qcow2
 
-# 4. Clone VM
-virsh shutdown ubuntu-srv
-virt-clone --original ubuntu-srv --name ubuntu-srv-clone --file /var/lib/libvirt/images/ubuntu-srv-clone.qcow2
+# 5. Scale CPU / RAM / Disk (VM đang tắt)
+virsh snapshot-delete $VM snap-initial
+virsh setvcpus $VM 4 --config --maximum && virsh setvcpus $VM 4 --config
+virsh setmaxmem $VM 4194304 --config && virsh setmem $VM 4194304 --config
+sudo qemu-img resize $IMG/$VM.qcow2 +10G
+virsh start $VM
+# Trong guest (kiểm tra bằng lsblk và vgs trước):
+#   sudo growpart /dev/vda 3
+#   sudo pvresize /dev/vda3
+#   sudo lvextend -r -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
+#   df -h /
 
-# 5. Điều chỉnh CPU (lên 4 vCPU), RAM (lên 4GB) và Disk (+10GB)
-virsh setvcpus ubuntu-srv 4 --config --maximum && virsh setvcpus ubuntu-srv 4 --config
-virsh setmaxmem ubuntu-srv 4194304 --config && virsh setmem ubuntu-srv 4194304 --config
-sudo qemu-img resize /var/lib/libvirt/images/ubuntu-srv.qcow2 +10G
-virsh start ubuntu-srv
-
-# 6. Export/Backup, Xóa và Restore VM
+# 6. Backup, xóa, restore
 mkdir -p ~/vm-backup
-virsh shutdown ubuntu-srv
-virsh dumpxml ubuntu-srv > ~/vm-backup/ubuntu-srv.xml
-sudo cp /var/lib/libvirt/images/ubuntu-srv.qcow2 ~/vm-backup/ubuntu-srv.qcow2
+virsh shutdown $VM || true; wait_off $VM
+virsh dumpxml $VM > ~/vm-backup/$VM.xml
+sudo cp --sparse=always $IMG/$VM.qcow2 ~/vm-backup/
 
-# Xóa hoàn toàn máy ảo
-virsh undefine ubuntu-srv --remove-all-storage
+virsh undefine $VM --remove-all-storage --snapshots-metadata
 
-# Restore (Khôi phục) lại máy ảo từ bản Backup
-sudo cp ~/vm-backup/ubuntu-srv.qcow2 /var/lib/libvirt/images/ubuntu-srv.qcow2
-virsh define ~/vm-backup/ubuntu-srv.xml
-virsh start ubuntu-srv
+sudo cp --sparse=always ~/vm-backup/$VM.qcow2 $IMG/
+virsh define ~/vm-backup/$VM.xml
+virsh start $VM
 ```
+
+Nếu bạn đang chạy bằng root như trên máy lab thì `sudo` vẫn chạy bình thường, không ảnh hưởng gì.
+
+## Giải thích các lệnh và tham số
+
+### Cài đặt và quyền
+| Lệnh / tham số | Ý nghĩa |
+|---|---|
+| `grep -Ec '(vmx\|svm)'` | Đếm số dòng CPU có cờ ảo hóa (`vmx` = Intel VT-x, `svm` = AMD-V). Bằng 0 nghĩa là chưa bật ảo hóa trong BIOS. |
+| `qemu-kvm` | Trình giả lập QEMU kèm KVM, phần chạy VM thật sự. |
+| `libvirt-daemon-system` / `libvirt-clients` | Daemon `libvirtd` quản lý VM, và bộ client (`virsh`). |
+| `virtinst` | Cung cấp `virt-install` và `virt-clone`. |
+| `cloud-guest-utils` | Cung cấp `growpart`, dùng để mở rộng partition. |
+| `usermod -aG libvirt,kvm` | `-a` là append (thêm, không ghi đè nhóm cũ), `-G` là danh sách nhóm. Nhóm `libvirt` cho phép dùng `virsh` không cần root, nhóm `kvm` cho phép truy cập `/dev/kvm`. |
+| `LIBVIRT_DEFAULT_URI=qemu:///system` | Nếu không đặt, user thường sẽ nối vào `qemu:///session` (VM riêng của user) và không thấy VM hệ thống. |
+
+### Tham số `virt-install`
+| Tham số | Ý nghĩa |
+|---|---|
+| `--name` | Tên VM trong libvirt. |
+| `--ram 2048` | RAM tính bằng MiB (2 GB). |
+| `--vcpus 2` | Số CPU ảo. |
+| `--disk path=...,format=qcow2,bus=virtio` | Gắn ổ đĩa. `qcow2` là định dạng hỗ trợ snapshot và cấp phát dần (thin). `virtio` là bus ảo hóa, nhanh hơn IDE/SATA, trong guest hiện ra là `/dev/vda`. |
+| `--os-variant ubuntu24.04` | Cho libvirt biết OS để chọn cấu hình tối ưu (driver, thiết bị). Xem danh sách bằng `osinfo-query os`. |
+| `--network network=default,model=virtio` | Nối vào mạng NAT mặc định `virbr0` của libvirt, card mạng virtio. VM ra internet được nhưng bên ngoài không vào thẳng VM. |
+| `--graphics none` | Không tạo màn hình đồ họa (VNC/SPICE), phù hợp server. |
+| `--console pty,target_type=serial` | Tạo cổng serial để thao tác qua terminal. |
+| `--location ISO,kernel=...,initrd=...` | Cho virt-install lấy kernel và initrd thẳng từ ISO để truyền được `--extra-args`. Ubuntu Server đặt chúng ở `casper/vmlinuz` và `casper/initrd`. |
+| `--extra-args 'console=ttyS0,115200n8 serial'` | Tham số kernel, bắt installer xuất ra cổng serial thay vì màn hình, nếu thiếu thì console sẽ đứng im. |
+
+### Snapshot, clone
+| Lệnh | Ý nghĩa |
+|---|---|
+| `snapshot-create-as VM tên --description` | Chụp trạng thái VM, lưu bên trong file qcow2 (internal snapshot). |
+| `snapshot-revert` | Quay VM về đúng trạng thái đã chụp. |
+| `snapshot-delete` | Xóa snapshot. Cần xóa trước khi `qemu-img resize` vì qcow2 còn snapshot nội bộ sẽ không resize được. |
+| `virt-clone --original --name --file` | Nhân bản VM: copy ổ đĩa, tạo XML mới, tự đổi tên, MAC và UUID để không trùng VM gốc. VM gốc phải tắt hoặc tạm dừng. |
+
+### Điều chỉnh tài nguyên
+| Lệnh | Ý nghĩa |
+|---|---|
+| `setvcpus ... --maximum --config` | Đặt **trần** số vCPU trong cấu hình. Phải nâng trần trước rồi mới nâng số vCPU hiện dùng. |
+| `setvcpus ... --config` | Đặt số vCPU dùng thật. `--config` nghĩa là ghi vào XML, có hiệu lực ở lần khởi động sau (không đổi trực tiếp VM đang chạy). |
+| `setmaxmem` / `setmem` | Tương tự cho RAM, đơn vị là **KiB**: 4194304 KiB = 4 GiB. Cũng phải nâng trần trước. |
+| `qemu-img resize ... +10G` | Phóng to ổ ảo thêm 10 GB. Chỉ đổi kích thước ổ ảo, bên trong guest vẫn phải mở rộng partition và filesystem. |
+| `growpart /dev/vda 3` | Nới partition số 3 ra hết phần ổ đĩa mới. |
+| `pvresize` | Báo cho LVM biết physical volume đã to hơn. |
+| `lvextend -r -l +100%FREE` | Mở rộng logical volume bằng toàn bộ phần trống, `-r` tự resize luôn filesystem. |
+
+### Backup / restore
+| Lệnh | Ý nghĩa |
+|---|---|
+| `virsh dumpxml` | Xuất cấu hình VM (CPU, RAM, disk, network) ra XML. Backup cần cả file này lẫn file qcow2. |
+| `cp --sparse=always` | Copy giữ nguyên vùng trống, file backup không bị phình ra. |
+| `undefine --remove-all-storage` | Xóa định nghĩa VM và cả các file ổ đĩa. |
+| `--snapshots-metadata` | Xóa luôn metadata snapshot, thiếu thì `undefine` báo lỗi nếu VM còn snapshot. |
+| `virsh define file.xml` | Đăng ký lại VM từ file XML. Vì `cp` đã trả file qcow2 về đúng đường dẫn cũ nên VM chạy lại bình thường. |
+
+### Hàm phụ
+`wait_off` lặp kiểm tra `virsh domstate` cho tới khi VM ở trạng thái `shut off`, vì `virsh shutdown` chỉ gửi tín hiệu tắt và trả về ngay. Nếu không chờ, bước clone hoặc backup có thể chạy khi VM chưa tắt hẳn.
 
 ---
 
