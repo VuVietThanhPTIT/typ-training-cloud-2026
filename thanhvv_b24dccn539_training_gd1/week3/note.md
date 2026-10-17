@@ -201,127 +201,76 @@ echo "Đã thêm $TARGET_USER vào nhóm libvirt,kvm -> LOGOUT/LOGIN lại rồi
 ```
 
 ## Phần 2: Tạo và quản lý VM
-
-```bash
 #!/usr/bin/env bash
 set -e
 export LIBVIRT_DEFAULT_URI=qemu:///system
 IMG=/var/lib/libvirt/images
-VM=ubuntu-srv
+VM=cirros-srv
 
 wait_off() { while [ "$(virsh domstate "$1")" != "shut off" ]; do sleep 2; done; }
 
-# 1. Tải ISO (tự lấy tên bản mới nhất) và tạo ổ đĩa
-cd $IMG
-ISO_NAME=$(curl -s https://releases.ubuntu.com/24.04/SHA256SUMS | grep -o 'ubuntu-24.04[0-9.]*-live-server-amd64.iso' | head -1)
-[ -f "$ISO_NAME" ] || sudo wget "https://releases.ubuntu.com/24.04/$ISO_NAME"
-[ -f $VM.qcow2 ] || sudo qemu-img create -f qcow2 $IMG/$VM.qcow2 20G
+# ========== 0. Cài KVM/libvirt và bật daemon ==========
+grep -Ec '(vmx|svm)' /proc/cpuinfo                 # phải > 0
+apt update
+apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst
+systemctl enable --now libvirtd
+virsh net-start default 2>/dev/null || true         # mạng NAT mặc định
+virsh net-autostart default
+virsh list --all                                    # không lỗi là OK
 
-# 2. Cài VM (tương tác, đi qua installer trong console)
-sudo virt-install \
+# ========== 1. Tải CirrOS, nới ổ lên 20G ==========
+cd $IMG
+[ -f $VM.qcow2 ] || wget -O $VM.qcow2 https://download.cirros-cloud.net/0.6.3/cirros-0.6.3-x86_64-disk.img
+qemu-img resize $VM.qcow2 20G
+
+# ========== 2. Tạo VM (2 vCPU, 2GB RAM) ==========
+virt-install \
   --name $VM --ram 2048 --vcpus 2 \
   --disk path=$IMG/$VM.qcow2,format=qcow2,bus=virtio \
-  --os-variant ubuntu24.04 --network network=default,model=virtio \
-  --graphics none --console pty,target_type=serial \
-  --location "$IMG/$ISO_NAME,kernel=casper/vmlinuz,initrd=casper/initrd" \
-  --extra-args 'console=ttyS0,115200n8 serial'
-# Thoát console: Ctrl + ]   |  Vào lại: virsh console ubuntu-srv
-# Trong guest kiểm tra: lscpu | free -h | lsblk
+  --os-variant generic --network network=default,model=virtio \
+  --graphics none --import --noautoconsole
 
-# 3. Snapshot / revert
+virsh console $VM        # thoát: Ctrl + ]   | login: cirros / gocubsgo
+# Quan sát trong guest:
+#   nproc ; grep -m1 'model name' /proc/cpuinfo   -> 2 vCPU
+#   free -m                                        -> ~2GB RAM
+#   lsblk (hoặc fdisk -l) ; df -h /                -> /dev/vda ~20G
+virsh domifaddr $VM      # xem IP của VM (chạy ở host)
+
+# ========== 3. Snapshot / revert ==========
 virsh snapshot-create-as $VM snap-initial --description "Clean OS"
 virsh snapshot-list $VM
 virsh snapshot-revert $VM snap-initial
 
-# 4. Clone
+# ========== 4. Clone ==========
 virsh shutdown $VM || true; wait_off $VM
-sudo virt-clone --original $VM --name $VM-clone --file $IMG/$VM-clone.qcow2
+virt-clone --original $VM --name $VM-clone --file $IMG/$VM-clone.qcow2
+virsh list --all
 
-# 5. Scale CPU / RAM / Disk (VM đang tắt)
-virsh snapshot-delete $VM snap-initial
-virsh setvcpus $VM 4 --config --maximum && virsh setvcpus $VM 4 --config
-virsh setmaxmem $VM 4194304 --config && virsh setmem $VM 4194304 --config
-sudo qemu-img resize $IMG/$VM.qcow2 +10G
+# ========== 5. Scale: 4 vCPU, 4GB RAM, +10G disk (VM đang tắt) ==========
+virsh snapshot-delete $VM snap-initial               # bắt buộc, còn snapshot thì không resize được
+virsh setvcpus $VM 4 --config --maximum
+virsh setvcpus $VM 4 --config
+virsh setmaxmem $VM 4194304 --config                 # đơn vị KiB = 4GiB
+virsh setmem $VM 4194304 --config
+qemu-img resize $IMG/$VM.qcow2 +10G
 virsh start $VM
-# Trong guest (kiểm tra bằng lsblk và vgs trước):
-#   sudo growpart /dev/vda 3
-#   sudo pvresize /dev/vda3
-#   sudo lvextend -r -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
-#   df -h /
+virsh console $VM
+# Kiểm tra trong guest: nproc ; free -m ; df -h /   (CirrOS tự giãn partition lúc boot, ~30G)
 
-# 6. Backup, xóa, restore
+# ========== 6. Backup, xóa, restore ==========
 mkdir -p ~/vm-backup
 virsh shutdown $VM || true; wait_off $VM
 virsh dumpxml $VM > ~/vm-backup/$VM.xml
-sudo cp --sparse=always $IMG/$VM.qcow2 ~/vm-backup/
+cp --sparse=always $IMG/$VM.qcow2 ~/vm-backup/
 
-virsh undefine $VM --remove-all-storage --snapshots-metadata
+virsh undefine $VM --remove-all-storage --snapshots-metadata   # xóa hoàn toàn
+virsh list --all; ls $IMG                                      # xác nhận đã mất
 
-sudo cp --sparse=always ~/vm-backup/$VM.qcow2 $IMG/
+cp --sparse=always ~/vm-backup/$VM.qcow2 $IMG/                 # restore
 virsh define ~/vm-backup/$VM.xml
 virsh start $VM
-```
-
-Nếu bạn đang chạy bằng root như trên máy lab thì `sudo` vẫn chạy bình thường, không ảnh hưởng gì.
-
-## Giải thích các lệnh và tham số
-
-### Cài đặt và quyền
-| Lệnh / tham số | Ý nghĩa |
-|---|---|
-| `grep -Ec '(vmx\|svm)'` | Đếm số dòng CPU có cờ ảo hóa (`vmx` = Intel VT-x, `svm` = AMD-V). Bằng 0 nghĩa là chưa bật ảo hóa trong BIOS. |
-| `qemu-kvm` | Trình giả lập QEMU kèm KVM, phần chạy VM thật sự. |
-| `libvirt-daemon-system` / `libvirt-clients` | Daemon `libvirtd` quản lý VM, và bộ client (`virsh`). |
-| `virtinst` | Cung cấp `virt-install` và `virt-clone`. |
-| `cloud-guest-utils` | Cung cấp `growpart`, dùng để mở rộng partition. |
-| `usermod -aG libvirt,kvm` | `-a` là append (thêm, không ghi đè nhóm cũ), `-G` là danh sách nhóm. Nhóm `libvirt` cho phép dùng `virsh` không cần root, nhóm `kvm` cho phép truy cập `/dev/kvm`. |
-| `LIBVIRT_DEFAULT_URI=qemu:///system` | Nếu không đặt, user thường sẽ nối vào `qemu:///session` (VM riêng của user) và không thấy VM hệ thống. |
-
-### Tham số `virt-install`
-| Tham số | Ý nghĩa |
-|---|---|
-| `--name` | Tên VM trong libvirt. |
-| `--ram 2048` | RAM tính bằng MiB (2 GB). |
-| `--vcpus 2` | Số CPU ảo. |
-| `--disk path=...,format=qcow2,bus=virtio` | Gắn ổ đĩa. `qcow2` là định dạng hỗ trợ snapshot và cấp phát dần (thin). `virtio` là bus ảo hóa, nhanh hơn IDE/SATA, trong guest hiện ra là `/dev/vda`. |
-| `--os-variant ubuntu24.04` | Cho libvirt biết OS để chọn cấu hình tối ưu (driver, thiết bị). Xem danh sách bằng `osinfo-query os`. |
-| `--network network=default,model=virtio` | Nối vào mạng NAT mặc định `virbr0` của libvirt, card mạng virtio. VM ra internet được nhưng bên ngoài không vào thẳng VM. |
-| `--graphics none` | Không tạo màn hình đồ họa (VNC/SPICE), phù hợp server. |
-| `--console pty,target_type=serial` | Tạo cổng serial để thao tác qua terminal. |
-| `--location ISO,kernel=...,initrd=...` | Cho virt-install lấy kernel và initrd thẳng từ ISO để truyền được `--extra-args`. Ubuntu Server đặt chúng ở `casper/vmlinuz` và `casper/initrd`. |
-| `--extra-args 'console=ttyS0,115200n8 serial'` | Tham số kernel, bắt installer xuất ra cổng serial thay vì màn hình, nếu thiếu thì console sẽ đứng im. |
-
-### Snapshot, clone
-| Lệnh | Ý nghĩa |
-|---|---|
-| `snapshot-create-as VM tên --description` | Chụp trạng thái VM, lưu bên trong file qcow2 (internal snapshot). |
-| `snapshot-revert` | Quay VM về đúng trạng thái đã chụp. |
-| `snapshot-delete` | Xóa snapshot. Cần xóa trước khi `qemu-img resize` vì qcow2 còn snapshot nội bộ sẽ không resize được. |
-| `virt-clone --original --name --file` | Nhân bản VM: copy ổ đĩa, tạo XML mới, tự đổi tên, MAC và UUID để không trùng VM gốc. VM gốc phải tắt hoặc tạm dừng. |
-
-### Điều chỉnh tài nguyên
-| Lệnh | Ý nghĩa |
-|---|---|
-| `setvcpus ... --maximum --config` | Đặt **trần** số vCPU trong cấu hình. Phải nâng trần trước rồi mới nâng số vCPU hiện dùng. |
-| `setvcpus ... --config` | Đặt số vCPU dùng thật. `--config` nghĩa là ghi vào XML, có hiệu lực ở lần khởi động sau (không đổi trực tiếp VM đang chạy). |
-| `setmaxmem` / `setmem` | Tương tự cho RAM, đơn vị là **KiB**: 4194304 KiB = 4 GiB. Cũng phải nâng trần trước. |
-| `qemu-img resize ... +10G` | Phóng to ổ ảo thêm 10 GB. Chỉ đổi kích thước ổ ảo, bên trong guest vẫn phải mở rộng partition và filesystem. |
-| `growpart /dev/vda 3` | Nới partition số 3 ra hết phần ổ đĩa mới. |
-| `pvresize` | Báo cho LVM biết physical volume đã to hơn. |
-| `lvextend -r -l +100%FREE` | Mở rộng logical volume bằng toàn bộ phần trống, `-r` tự resize luôn filesystem. |
-
-### Backup / restore
-| Lệnh | Ý nghĩa |
-|---|---|
-| `virsh dumpxml` | Xuất cấu hình VM (CPU, RAM, disk, network) ra XML. Backup cần cả file này lẫn file qcow2. |
-| `cp --sparse=always` | Copy giữ nguyên vùng trống, file backup không bị phình ra. |
-| `undefine --remove-all-storage` | Xóa định nghĩa VM và cả các file ổ đĩa. |
-| `--snapshots-metadata` | Xóa luôn metadata snapshot, thiếu thì `undefine` báo lỗi nếu VM còn snapshot. |
-| `virsh define file.xml` | Đăng ký lại VM từ file XML. Vì `cp` đã trả file qcow2 về đúng đường dẫn cũ nên VM chạy lại bình thường. |
-
-### Hàm phụ
-`wait_off` lặp kiểm tra `virsh domstate` cho tới khi VM ở trạng thái `shut off`, vì `virsh shutdown` chỉ gửi tín hiệu tắt và trả về ngay. Nếu không chờ, bước clone hoặc backup có thể chạy khi VM chưa tắt hẳn.
-
+virsh list --all
 ---
 
 ## PHẦN 3: TỔNG QUAN VỀ CONTAINER
