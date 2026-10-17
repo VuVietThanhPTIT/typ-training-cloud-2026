@@ -178,36 +178,14 @@ $$\text{Guest Virtual Address (GVA)} \xrightarrow{\text{Guest Page Tables}} \tex
 ---
 
 ### 7. Thực hành quản lý VM (Với KVM/QEMU/libvirt trên Ubuntu)
-Mình viết lại theo kiểu thêm user vào nhóm `libvirt`/`kvm`, dùng `sudo` cho các lệnh cần quyền ghi vào `/var/lib/libvirt/images`. Vì nhóm mới chỉ có hiệu lực sau khi đăng nhập lại, mình tách làm 2 phần.
-
-## Phần 1: Cài đặt và thêm user
 
 ```bash
-#!/usr/bin/env bash
-set -e
-
-# Kiểm tra CPU hỗ trợ ảo hóa (kết quả phải > 0)
-grep -Ec '(vmx|svm)' /proc/cpuinfo
-
-sudo apt update
-sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients \
-  bridge-utils virtinst cloud-image-utils cloud-guest-utils
-sudo systemctl enable --now libvirtd
-
-# Thêm user hiện tại (kể cả khi chạy bằng sudo) vào nhóm libvirt và kvm
-TARGET_USER=${SUDO_USER:-$USER}
-sudo usermod -aG libvirt,kvm "$TARGET_USER"
-echo "Đã thêm $TARGET_USER vào nhóm libvirt,kvm -> LOGOUT/LOGIN lại rồi chạy Phần 2"
-```
-
-## Phần 2: Tạo và quản lý VM
 #!/usr/bin/env bash
 set -e
 export LIBVIRT_DEFAULT_URI=qemu:///system
 IMG=/var/lib/libvirt/images
 VM=cirros-srv
 
-wait_off() { while [ "$(virsh domstate "$1")" != "shut off" ]; do sleep 2; done; }
 
 # ========== 0. Cài KVM/libvirt và bật daemon ==========
 grep -Ec '(vmx|svm)' /proc/cpuinfo                 # phải > 0
@@ -271,7 +249,8 @@ cp --sparse=always ~/vm-backup/$VM.qcow2 $IMG/                 # restore
 virsh define ~/vm-backup/$VM.xml
 virsh start $VM
 virsh list --all
----
+```
+
 
 ## PHẦN 3: TỔNG QUAN VỀ CONTAINER
 
