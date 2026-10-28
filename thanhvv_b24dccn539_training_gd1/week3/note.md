@@ -180,57 +180,77 @@ $$\text{Guest Virtual Address (GVA)} \xrightarrow{\text{Guest Page Tables}} \tex
 ### 7. Thực hành quản lý VM (Với KVM/QEMU/libvirt trên Ubuntu)
 
 ```bash
-# 1. Kiểm tra CPU hỗ trợ ảo hóa và cài đặt KVM
-egrep -c '(vmx|svm)' /proc/cpuinfo
-sudo apt update && sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst cloud-image-utils
-sudo usermod -aG libvirt,kvm $USER && newgrp libvirt
+#!/usr/bin/env bash
+set -e
+export LIBVIRT_DEFAULT_URI=qemu:///system
+IMG=/var/lib/libvirt/images
+VM=cirros-srv
 
-# 2. Tạo ổ đĩa qcow2 (20GB) và khởi tạo VM Ubuntu Server
-sudo qemu-img create -f qcow2 /var/lib/libvirt/images/ubuntu-srv.qcow2 20G
+
+# ========== 0. Cài KVM/libvirt và bật daemon ==========
+grep -Ec '(vmx|svm)' /proc/cpuinfo                 # phải > 0
+apt update
+apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst
+systemctl enable --now libvirtd
+virsh net-start default 2>/dev/null || true         # mạng NAT mặc định
+virsh net-autostart default
+virsh list --all                                    # không lỗi là OK
+
+# ========== 1. Tải CirrOS, nới ổ lên 20G ==========
+cd $IMG
+[ -f $VM.qcow2 ] || wget -O $VM.qcow2 https://download.cirros-cloud.net/0.6.3/cirros-0.6.3-x86_64-disk.img
+qemu-img resize $VM.qcow2 20G
+
+# ========== 2. Tạo VM (2 vCPU, 2GB RAM) ==========
 virt-install \
-  --name ubuntu-srv --ram 2048 --vcpus 2 \
-  --disk path=/var/lib/libvirt/images/ubuntu-srv.qcow2,format=qcow2,bus=virtio \
-  --os-variant ubuntu24.04 --network network=default,model=virtio \
-  --graphics none --console pty,target_type=serial \
-  --location '[https://releases.ubuntu.com/24.04/ubuntu-24.04.1-live-server-amd64.iso](https://releases.ubuntu.com/24.04/ubuntu-24.04.1-live-server-amd64.iso)' \
-  --extra-args 'console=ttyS0,115200n8 serial'
+  --name $VM --ram 2048 --vcpus 2 \
+  --disk path=$IMG/$VM.qcow2,format=qcow2,bus=virtio \
+  --os-variant generic --network network=default,model=virtio \
+  --graphics none --import --noautoconsole
 
-# Quan sát tài nguyên bên trong Guest OS sau khi cài đặt:
-lscpu      # Kiểm tra 2 vCPU và Hypervisor vendor: KVM
-free -h    # Kiểm tra 2GB RAM
-lsblk      # Kiểm tra ổ đĩa ảo /dev/vda dung lượng 20GB
+virsh console $VM        # thoát: Ctrl + ]   | login: cirros / gocubsgo
+# Quan sát trong guest:
+#   nproc ; grep -m1 'model name' /proc/cpuinfo   -> 2 vCPU
+#   free -m                                        -> ~2GB RAM
+#   lsblk (hoặc fdisk -l) ; df -h /                -> /dev/vda ~20G
+virsh domifaddr $VM      # xem IP của VM (chạy ở host)
 
-# 3. Tạo Snapshot và Revert
-virsh snapshot-create-as --domain ubuntu-srv --name "snap-initial" --description "Clean OS"
-virsh snapshot-list --domain ubuntu-srv
-virsh snapshot-revert --domain ubuntu-srv --snapshotname "snap-initial"
+# ========== 3. Snapshot / revert ==========
+virsh snapshot-create-as $VM snap-initial --description "Clean OS"
+virsh snapshot-list $VM
+virsh snapshot-revert $VM snap-initial
 
-# 4. Clone VM
-virsh shutdown ubuntu-srv
-virt-clone --original ubuntu-srv --name ubuntu-srv-clone --file /var/lib/libvirt/images/ubuntu-srv-clone.qcow2
+# ========== 4. Clone ==========
+virsh shutdown $VM || true; wait_off $VM
+virt-clone --original $VM --name $VM-clone --file $IMG/$VM-clone.qcow2
+virsh list --all
 
-# 5. Điều chỉnh CPU (lên 4 vCPU), RAM (lên 4GB) và Disk (+10GB)
-virsh setvcpus ubuntu-srv 4 --config --maximum && virsh setvcpus ubuntu-srv 4 --config
-virsh setmaxmem ubuntu-srv 4194304 --config && virsh setmem ubuntu-srv 4194304 --config
-sudo qemu-img resize /var/lib/libvirt/images/ubuntu-srv.qcow2 +10G
-virsh start ubuntu-srv
+# ========== 5. Scale: 4 vCPU, 4GB RAM, +10G disk (VM đang tắt) ==========
+virsh snapshot-delete $VM snap-initial               # bắt buộc, còn snapshot thì không resize được
+virsh setvcpus $VM 4 --config --maximum
+virsh setvcpus $VM 4 --config
+virsh setmaxmem $VM 4194304 --config                 # đơn vị KiB = 4GiB
+virsh setmem $VM 4194304 --config
+qemu-img resize $IMG/$VM.qcow2 +10G
+virsh start $VM
+virsh console $VM
+# Kiểm tra trong guest: nproc ; free -m ; df -h /   (CirrOS tự giãn partition lúc boot, ~30G)
 
-# 6. Export/Backup, Xóa và Restore VM
+# ========== 6. Backup, xóa, restore ==========
 mkdir -p ~/vm-backup
-virsh shutdown ubuntu-srv
-virsh dumpxml ubuntu-srv > ~/vm-backup/ubuntu-srv.xml
-sudo cp /var/lib/libvirt/images/ubuntu-srv.qcow2 ~/vm-backup/ubuntu-srv.qcow2
+virsh shutdown $VM || true; wait_off $VM
+virsh dumpxml $VM > ~/vm-backup/$VM.xml
+cp --sparse=always $IMG/$VM.qcow2 ~/vm-backup/
 
-# Xóa hoàn toàn máy ảo
-virsh undefine ubuntu-srv --remove-all-storage
+virsh undefine $VM --remove-all-storage --snapshots-metadata   # xóa hoàn toàn
+virsh list --all; ls $IMG                                      # xác nhận đã mất
 
-# Restore (Khôi phục) lại máy ảo từ bản Backup
-sudo cp ~/vm-backup/ubuntu-srv.qcow2 /var/lib/libvirt/images/ubuntu-srv.qcow2
-virsh define ~/vm-backup/ubuntu-srv.xml
-virsh start ubuntu-srv
+cp --sparse=always ~/vm-backup/$VM.qcow2 $IMG/                 # restore
+virsh define ~/vm-backup/$VM.xml
+virsh start $VM
+virsh list --all
 ```
 
----
 
 ## PHẦN 3: TỔNG QUAN VỀ CONTAINER
 
